@@ -2,7 +2,7 @@
 
 Extends git log, git blame, git status, git show and git diff with performance change data from nyrkio.com
 
-This is a work in progress, currently `git perf log` and `git perf status` are supported.
+This is a work in progress, currently `git perf blame` `git perf log` and `git perf status` are supported.
 
 ## Installation
 
