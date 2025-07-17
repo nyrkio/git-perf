@@ -1,6 +1,10 @@
 # git-perf - Your git performance history
 
-Extends git log, git blame, git status, git show and git diff with performance change data from nyrkio.com
+Extends git log, git blame, git status, git show and git diff with performance change data from nyrkio.com.
+
+Note that the focus is on surfacing the statistically significant performance change points, as highlighted
+by Nyrkiö. Benchmark results for each individual commit, or the random variation from commit to commit, is
+not shown at all.
 
 This is a work in progress, currently `git perf blame` `git perf log` and `git perf status` are supported.
 
