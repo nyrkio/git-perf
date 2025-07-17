@@ -1,0 +1,355 @@
+#!/bin/python3
+
+
+# git perf - Annotate `git log` and `git perf` with performance change points
+#
+# Example:
+#
+#     $ git perf log
+#
+#       commit f7465f665de751d66815da4b1a7f9a46d21ce9e3
+#       Author: Pere Diaz Bou
+#       Date:   Tue Jul 8 15:54:28 2025 +0200
+#
+#           add checkpoint lock to wal
+#
+#       commit d0a80c6acd4b9b1f8967fd9db7a2edb080803ba5
+#       Merge: 7c4bb3d4 99e0cf06
+#       Author: Pekka Enberg
+#       Date:   Tue Jul 8 18:48:36 2025 +0300
+#
+#           Merge 'Support except operator for Compound select ' from meteorgan
+#
+#           Closes: #1574
+#
+#           Reviewed-by: Jussi Saurio
+#
+#           Closes #1858
+#
+#         perf change:
+#           turso/main/mvcc-ops-throughput/begin_tx___rollback_tx:
+#           time: +22.29 %   305.9561->374.1550
+#
+#
+#       commit 95c150242e97505d629b1e5e102957d8e055dbeb
+#       Author: Henrik Ingo
+#       Date:   Fri Jul 4 17:25:33 2025 +0300
+#
+#           FrontPage: Center logo when logged in
+
+
+# Note that this is intentionally a single file with no external dependencies beyond standard modules
+
+# Copyright 2025 Nyrkiö Oy
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import datetime
+import subprocess
+import sys
+import pprint
+import urllib.parse
+import requests
+
+
+def git_real(args):
+    result = subprocess.run(
+        ["git"] + args,
+        capture_output=True,
+        text=True,
+        check=True
+    )
+    return result.stdout.strip().split("\n")
+
+def git_commits_in_merge(merge_commit):
+    """
+    Get all commits that are part of this merge commit.
+
+    Nyrkiö will typically deal with merge commits, because benchmarks run on PRs.
+    OTOH git blame will show the actual commit that modified the code. So we want both.
+    """
+    all_commits = []
+    try:
+        result = subprocess.run(
+            ["git", "log", merge_commit + "^.." + merge_commit],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        if "-v" in sys.argv:
+            print(e)
+        else:
+            return [merge_commit]
+    lines = result.stdout.strip().split("\n")
+    for line in lines:
+        if not line.startswith("commit "):
+            continue
+        all_commits.append(line[7:])
+    return all_commits
+
+def annotate_commits(lines, annotations, branch):
+    nyrkio_repos = annotations.keys()
+    ann_commits = []
+    for k,v in annotations.items():
+        ann_commits += list(v.keys())
+
+    sha = None
+    for line in lines:
+        if line.startswith("commit "):
+            old_sha = sha
+            sha = line[len("commit "):]
+            if old_sha in ann_commits:
+                for repo in nyrkio_repos:
+                    print(nyrkio_cp_message(repo, branch, old_sha, annotations[repo][old_sha]))
+
+        print(line)
+
+def get_change_dir(short_sha, annotations, reverse_lookup_commmits):
+    direction = "⇕"
+    for repo, data in annotations.items():
+        for repo_sha in data.keys():
+            if repo_sha == reverse_lookup_commmits[short_sha]:
+                value = data[repo_sha][0]["cp_values"][0]['forward_change_percent']
+                if value < 0:
+                    direction = "↓"
+                    if abs(value) > 10:
+                        direction = "⇊"
+                    if abs(value) > 100:
+                        direction = "⇩"
+                elif value > 0:
+                    direction = "↑"
+                    if abs(value) > 10:
+                        direction = "⇈"
+                    if abs(value) > 100:
+                        direction = "⇑"
+
+
+    return direction
+
+def annotate_blame(lines, annotations, branch):
+    nyrkio_repos = annotations.keys()
+    ann_commits = []
+    reverse_lookup_commmits = {}
+    for k,v in annotations.items():
+        # short_shas = [s[:9] for s in list(v.keys())]
+        # ann_commits += short_shas
+        ann_commits.extend( v.keys())
+
+    all_commits = []
+    for merge_commit in ann_commits:
+        short_shas = [s[:9] for s in git_commits_in_merge(merge_commit)]
+        all_commits.extend( short_shas)
+        for ss in short_shas:
+            reverse_lookup_commmits[ss] = merge_commit
+        # all_commits.extend(git_commits_in_merge(merge_commit))
+
+    for line in lines:
+        short_sha = line[:9]
+        a = line[:9]
+        b = line[10:]
+        if short_sha in all_commits:
+            change_marker = get_change_dir(short_sha, annotations, reverse_lookup_commmits)
+            print("{}{} {}".format(a, change_marker, b))
+        else:
+            print("{}  {}".format(a, b))
+
+def annotate_status(lines, annotations):
+    for line in lines:
+        print(line)
+    nyrkio_status_message(annotations)
+
+def git_http_repo(remote_repo):
+    if remote_repo.startswith("git@github.com"):
+        org_and_repo = remote_repo[15:-4]
+        parts = org_and_repo.split("/")
+        org = parts[0]
+        repo = parts[1]
+        return "https://github.com/{}/{}".format(org, repo)
+
+    return remote_repo
+
+def _parse_upstream(line):
+    line = line.split("\t")[1]
+    if line.endswith(" (push)"):
+        return line[:-7]
+    if line.endswith(" (fetch)"):
+        return line[:-8]
+    return line
+
+def git_upstream():
+    result = subprocess.run(
+        ["git", "remote", "-v"],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+    lines = result.stdout.strip().split("\n")
+    newlines = []
+    for line in lines:
+        newlines.append(_parse_upstream(line))
+
+    # Usually push and fetch are the same, remove duplicates
+    return set(newlines)
+
+def git_branch():
+    result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+    lines = result.stdout.strip().split("\n")
+    return lines[0]
+
+# simplify: in first version just support public repos. (no token needed)
+def nyrkio_get_changes(repo, branch):
+    safe_repo = urllib.parse.quote_plus(git_http_repo(repo)) + "/" + branch + "/"
+    # safe_repo = git_http_repo(repo) + "/" + branch + "/"
+    url = "https://nyrkio.com/api/v0/public/changes/perCommit/" + safe_repo
+    response = requests.get(url)
+    if response.status_code < 400:
+        if "-v" in sys.argv:
+            print("Fethed change points from {}".format(url))
+        return nyrkio_group_by_commit(response.json())
+    else:
+        if "-v" in sys.argv:
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                return False
+        else:
+            return False
+
+def nyrkio_group_by_commit(resp):
+    by_commit = {}
+    for r in resp:
+        sha = r["_id"]["git_commit"]
+        if sha not in by_commit:
+            by_commit[sha] = []
+        by_commit[sha].append(r)
+    return by_commit
+
+def nyrkio_cp_message(repo, branch, sha, all_changes):
+    http_repo = git_http_repo(repo)
+    urlencoded_repo = urllib.parse.quote_plus(http_repo)
+    just_repo = urlencoded_repo[len("https%3A%2F%2Fgithub.com%2F"):]
+    # Note the double url encode on the repo. I think this is needed because the use case
+    # is that user clicks on this and opens the page in the browser, at which point it unencodes
+    # once, or something. Then the nginx forward goes to nyrkio.com/public/ where we still have %27 left
+    nyrkio_public_root_url = "https://nyrk.io/gh/{}/{}".format(urllib.parse.quote_plus(just_repo), branch)
+    msg = "  perf change:           {}\n".format(nyrkio_public_root_url)
+    for o in all_changes:
+        msg += "      {}:\n".format(o["test_name"])
+        for c in o["cp_values"]:
+            msg += "        {}: {:+.2f} %   {:.4f}->{:.4f}\n".format(c["metric"], c["forward_change_percent"], c["mean_before"], c["mean_after"])
+    return msg
+
+def nyrkio_status_message(all_changes):
+    print()
+    if len(all_changes.keys()) > 0:
+        most_recent = {'time':-1}
+
+        # print("Nyrkiö change detection summary: {}".format("")) #",".join(list(all_changes.keys()))))
+        for k,v in all_changes.items():
+            test_names = {}
+            metrics = {}
+            num_changes = 0
+            branch = ""
+            for commit, changes in v.items():
+                for c in changes:
+                    branch = c["attributes"]["branch"]
+                    if c["test_name"] not in test_names:
+                        test_names[c["test_name"]] = 0
+                        metrics[c["test_name"]] = set()
+
+                    test_names[c["test_name"]] += 1
+                    metrics[c["test_name"]].update(c["metric"]["name"])
+                    num_changes += len(c["metric"]["name"])
+                    if most_recent["time"] < c["time"]:
+                        most_recent = c
+
+            num_tests = len(test_names.keys())
+            num_metrics = 0
+            max_test = ""
+            max_test_num = 0
+            for kk, vv in test_names.items():
+                if vv > max_test_num:
+                    max_test_num = vv
+                    max_test = kk
+            for kk, vv in metrics.items():
+                num_metrics += len(vv)
+            most_recent_metrics = list(zip(most_recent["metric"]["name"], most_recent["metric"]["value"]))
+            most_recent_metrics = ["{}:{}".format(tup[0],tup[1]) for tup in most_recent_metrics]
+
+            print("{}/{}: {} commits flagged as either a regression or improvement".format(k, branch, len(v.keys())))
+            # TODO: Use higher_is_better / lower_is_better for users that have those
+            print("                  The most recent perf change is {} at {}: {}".format(
+                most_recent["_id"]["git_commit"][:7], todate(most_recent["time"]), " ".join(most_recent_metrics) ))
+            print("                  {} metrics across {} tests reported {} changes.".format(
+                num_metrics, num_tests, num_changes))
+            print("                  The test '{}' caused {} of above changes.".format(
+                max_test, max_test_num))
+            http_repo = git_http_repo(k)
+            urlencoded_repo = urllib.parse.quote_plus(http_repo)
+            just_repo = urlencoded_repo[len("https%3A%2F%2Fgithub.com%2F"):]
+            nyrkio_public_root_url = "https://nyrk.io/gh/{}/{}".format(urllib.parse.quote_plus(just_repo), branch)
+            print("                  For more details, see {}".format(nyrkio_public_root_url))
+
+
+def todate(timestamp):
+    return datetime.datetime.fromtimestamp(timestamp)
+
+def main():
+    try:
+        main_wrapped()
+    except BrokenPipeError as e:
+        if "-v" in sys.argv:
+            raise
+        else:
+            pass
+
+def main_wrapped():
+    upstreams = git_upstream()
+    branch = git_branch()
+    nyrkio_results = {}
+    last_result = None
+    upstreams = list(upstreams)
+    if "-v" in sys.argv:
+        print(upstreams)
+    for repo in upstreams:
+        if "-v" in sys.argv:
+            print(repo,branch)
+        changes =  nyrkio_get_changes(repo, branch)
+        if changes:
+            nyrkio_results[repo] = changes
+            last_result = changes
+
+    if len(sys.argv):
+        lines = git_real(sys.argv[1:])
+
+        if "log" == sys.argv[1]:
+            annotate_commits(lines, nyrkio_results, branch)
+
+        if "blame" == sys.argv[1]:
+            annotate_blame(lines, nyrkio_results, branch)
+
+
+        if "status" == sys.argv[1]:
+            annotate_status(lines, nyrkio_results)
+
+
+
+if __name__ == "__main__":
+    main()
